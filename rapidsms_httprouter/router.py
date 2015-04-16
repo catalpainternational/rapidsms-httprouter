@@ -13,6 +13,8 @@ from urllib2 import urlopen
 import time
 import re
 
+import tt_utils as tt
+
 # we make sure only one thread is modifying db messages a time
 outgoing_db_lock = Lock()
 
@@ -36,6 +38,7 @@ class HttpRouterThread(Thread, LoggerMixin):
     This thread is just a worker thread for messages.  The run() method pops off a message to work on
     and continues appropriately.
     """
+    tt_cookies = None
 
     def __init__(self, **kwargs):
         Thread.__init__(self, **kwargs)
@@ -63,7 +66,7 @@ class HttpRouterThread(Thread, LoggerMixin):
                         outgoing_message.save()
 
                         # frees our update lock
-                        transaction.commit()                        
+                        transaction.commit()
 
                         # process the outgoing phases for this message
                         send_msg = get_router().process_outgoing_phases(outgoing_message)
@@ -83,6 +86,22 @@ class HttpRouterThread(Thread, LoggerMixin):
 
             self._isbusy = False
             time.sleep(0.5)
+
+
+    def send_tt_message(self, message):
+        """ build_send_url and fetch_url rolled into one """
+        if self.tt_cookies == None:
+            self.tt_cookies = tt.get_login_cookies()
+        phone = message.connection.identity
+        text =  message.text
+        code = tt.send_message(phone,text,self.tt_cookies,timeout=15)
+        if code == 401: # old cookie ? Let's try with some fresh ones
+            self.tt_cookies = tt.get_login_cookies()
+            return tt.send_message(phone,text,self.tt_cookies)
+        # anything else
+        return code
+
+
 
     def fetch_url(self, url):
         """
@@ -118,12 +137,12 @@ class HttpRouterThread(Thread, LoggerMixin):
         if type(router_url) is dict:
             router_dict = router_url
             backend_name = msg.connection.backend.name
-            
+
             # is there an entry for this backend?
             if backend_name in router_dict:
                 router_url = router_dict[backend_name]
 
-            # if not, look for a default backend 
+            # if not, look for a default backend
             elif 'default' in router_dict:
                 router_url = router_dict['default']
 
@@ -139,19 +158,22 @@ class HttpRouterThread(Thread, LoggerMixin):
 
     def send_message(self, msg, **kwargs):
         """
-        Sends the message off.  We first try to directly contact our sms router to deliver it, 
+        Sends the message off.  We first try to directly contact our sms router to deliver it,
         if we fail, then we just add it to our outgoing queue.
         """
         global outgoing_db_lock
 
         # and actually hand the message off to our router URL
         try:
-            url = self.build_send_url(msg, kwargs)
-            status_code = self.fetch_url(url)
+            # url = self.build_send_url(msg, kwargs)
+            # status_code = self.fetch_url(url)
+            status_code = self.send_tt_message(msg)
             outgoing_db_lock.acquire()
             # kannel likes to send 202 responses, really any
             # 2xx value means things went okay
-            if int(status_code/100) == 2:
+            print str(status_code)
+            print msg
+            if int(status_code / 100) == 2:
                 self.info("SMS[%d] SENT" % msg.id)
                 msg.status = 'S'
                 msg.save()
@@ -200,7 +222,7 @@ class HttpRouter(object, LoggerMixin):
         global outgoing_db_lock
 
         # lookup / create this backend
-        # TODO: is this too flexible?  Perhaps we should do this upon initialization and refuse 
+        # TODO: is this too flexible?  Perhaps we should do this upon initialization and refuse
         # any backends not found in our settings.  But I hate dropping messages on the floor.
         backend, created = Backend.objects.get_or_create(name=backend)
 
@@ -211,6 +233,9 @@ class HttpRouter(object, LoggerMixin):
 
         # finally, create our db message
         outgoing_db_lock.acquire()
+
+        # force to unicode
+        text = unicode(text)
 
         message = Message.objects.create(connection=connection,
                                          text=text,
@@ -243,11 +268,11 @@ class HttpRouter(object, LoggerMixin):
 
         # and our rapidsms transient message for processing
         msg = IncomingMessage(db_message.connection, text, db_message.date)
-        
+
         # add an extra property to IncomingMessage, so httprouter-aware
         # apps can make use of it during the handling phase
         msg.db_message = db_message
-        
+
         self.info("SMS[%d] IN (%s) : %s" % (db_message.id, msg.connection, msg.text))
         try:
             for phase in self.incoming_phases:
@@ -283,18 +308,18 @@ class HttpRouter(object, LoggerMixin):
                     elif phase == "handle":
                         if handled is True:
                             self.debug("Short-circuited")
-                            # mark the message handled to avoid the 
+                            # mark the message handled to avoid the
                             # default phase firing unnecessarily
                             msg.handled = True
                             break
-                    
+
                     elif phase == "default":
                         # allow default phase of apps to short circuit
-                        # for prioritized contextual responses.   
+                        # for prioritized contextual responses.
                         if handled is True:
                             self.debug("Short-circuited default")
                             break
-                        
+
         except StopIteration:
             pass
 
@@ -302,7 +327,7 @@ class HttpRouter(object, LoggerMixin):
         db_message.status = 'H'
         db_message.save()
         outgoing_db_lock.release()
-        
+
         db_responses = []
 
         # now send the message responses
@@ -360,7 +385,7 @@ class HttpRouter(object, LoggerMixin):
                 outgoing_worker_threads.append(worker)
 
         return db_message
-                
+
     def handle_outgoing(self, msg, source=None):
         """
         Sends the passed in RapidSMS message off.  Optionally ties the outgoing message to the incoming
@@ -368,7 +393,7 @@ class HttpRouter(object, LoggerMixin):
         """
         # add it to our outgoing queue
         db_message = self.add_outgoing(msg.connection, msg.text, source, status='P')
-        
+
         return db_message
 
     def process_outgoing_phases(self, outgoing):
@@ -381,7 +406,7 @@ class HttpRouter(object, LoggerMixin):
         # create a RapidSMS outgoing message
         msg = OutgoingMessage(outgoing.connection, outgoing.text.replace('%','%%'))
         msg.db_message = outgoing
-        
+
         send_msg = True
         for phase in self.outgoing_phases:
             self.debug("Out %s phase" % phase)
@@ -459,7 +484,7 @@ class HttpRouter(object, LoggerMixin):
 
         # mark ourselves as started
         self.started = True
-        
+
 # we'll get started when we first get used
 http_router = HttpRouter()
 http_router_lock = Lock()
